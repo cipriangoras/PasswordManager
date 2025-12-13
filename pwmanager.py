@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import sys
 import datetime
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -7,9 +8,11 @@ from cryptography.hazmat.primitives import hashes
 
 DB_NAME = "pwmanager.db"
 
+# --- 1. SETUP & CRYPTO (La fel ca Faza 1) ---
+
 def get_db_connection():
     conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row  
+    conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
@@ -48,78 +51,132 @@ def get_or_create_salt(conn):
 def derive_key(master_password, salt):
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
-        length=32,          
+        length=32,
         salt=salt,
-        iterations=100000,  
+        iterations=100000,
     )
     return kdf.derive(master_password.encode('utf-8'))
 
 def encrypt_password(key, plaintext_password):
-
     aesgcm = AESGCM(key)
-    nonce = os.urandom(12) 
-    
+    nonce = os.urandom(12)
     ciphertext = aesgcm.encrypt(nonce, plaintext_password.encode('utf-8'), None)
-    
     return nonce + ciphertext
 
 def decrypt_password(key, encrypted_data):
-
     aesgcm = AESGCM(key)
-    
     nonce = encrypted_data[:12]
     ciphertext = encrypted_data[12:]
-    
-    plaintext = aesgcm.decrypt(nonce, ciphertext, None)
-    return plaintext.decode('utf-8')
+    return aesgcm.decrypt(nonce, ciphertext, None).decode('utf-8')
 
 
-def run_phase_1_test():
-    print("Faza 1: Vault Setup & Crypto Check")
-    
-
-    init_db()
-    print("[OK] Am intitializat db ul.")
-    
-    # 
-    master_pass = "SecretMaster123!"
-    conn = get_db_connection()
-    salt = get_or_create_salt(conn)
-    key = derive_key(master_pass, salt)
-    print(f"[OK] Cheie derivata din master password (Salt stocat: {salt.hex()})")
-    
-    website = "google.com"
-    username = "user@gmail.com"
-    plain_pass = "MySuperSecretPassword"
-    
-    enc_pass = encrypt_password(key, plain_pass)
+def handle_add(conn, key, website, username, password):
+    cursor = conn.cursor()
+    encrypted_pw = encrypt_password(key, password)
     now = datetime.datetime.now().isoformat()
     
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR REPLACE INTO passwords (website, username, encrypted_password, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (website, username, enc_pass, now, now))
-    conn.commit()
-    print(f"[OK] Intrare salvata criptata pentru {website}.")
+    cursor.execute("SELECT website FROM passwords WHERE website = ?", (website,))
+    exists = cursor.fetchone()
     
-    cursor.execute("SELECT encrypted_password FROM passwords WHERE website = ?", (website,))
+    if exists:
+        cursor.execute('''
+            UPDATE passwords 
+            SET username=?, encrypted_password=?, updated_at=? 
+            WHERE website=?
+        ''', (username, encrypted_pw, now, website))
+        print(f"Updated entry for {website}")
+    else:
+        cursor.execute('''
+            INSERT INTO passwords (website, username, encrypted_password, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (website, username, encrypted_pw, now, now))
+        print(f"Added entry for {website}")
+    conn.commit()
+
+def handle_get(conn, key, website):
+    cursor = conn.cursor()
+    cursor.execute("SELECT username, encrypted_password FROM passwords WHERE website = ?", (website,))
     row = cursor.fetchone()
     
     if row:
-        stored_enc_data = row['encrypted_password']
-        decrypted_pass = decrypt_password(key, stored_enc_data)
-        
-        print(f"\nVerificare rezultat:")
-        print(f"Original:  {plain_pass}")
-        print(f"Decriptat: {decrypted_pass}")
-        
-        if plain_pass == decrypted_pass:
-            print("\n[SUCCES] Criptarea si decriptarea functioneaza perfect!")
-        else:
-            print("\n[EROARE] Parolele nu se potrivesc!")
+        try:
+            decrypted_pass = decrypt_password(key, row['encrypted_password'])
+            print(f"Website:  {website}")
+            print(f"Username: {row['username']}")
+            print(f"Password: {decrypted_pass}")
+        except Exception:
+            print("Error: Decryption failed (Wrong master password or corrupt data).")
+    else:
+        print(f"No entry found for {website}")
+
+def handle_remove(conn, website):
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM passwords WHERE website = ?", (website,))
+    if cursor.rowcount > 0:
+        conn.commit()
+        print(f"Removed entry for {website}")
+    else:
+        print(f"No entry found for {website}")
+
+def handle_list(conn):
+    cursor = conn.cursor()
+    cursor.execute("SELECT website, username FROM passwords")
+    rows = cursor.fetchall()
     
-    conn.close()
+    if not rows:
+        print("Vault is empty.")
+    else:
+        print(f"{'WEBSITE':<20} | {'USERNAME'}")
+        print("-" * 40)
+        for row in rows:
+            print(f"{row['website']:<20} | {row['username']}")
+
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: pwmanager.py <master_password> -add <site> <user> <pass>")
+        print("       pwmanager.py <master_password> -get <site>")
+        print("       pwmanager.py <master_password> -remove <site>")
+        print("       pwmanager.py <master_password> -list")
+        return
+
+    master_password = sys.argv[1]
+    command = sys.argv[2]
+    
+    init_db()
+    conn = get_db_connection()
+    salt = get_or_create_salt(conn)
+    key = derive_key(master_password, salt)
+    
+    try:
+        if command == '-add':
+            if len(sys.argv) != 6:
+                print("Usage: -add <website> <username> <password>")
+                return
+            handle_add(conn, key, sys.argv[3], sys.argv[4], sys.argv[5])
+            
+        elif command == '-get':
+            if len(sys.argv) != 4:
+                print("Usage: -get <website>")
+                return
+            handle_get(conn, key, sys.argv[3])
+            
+        elif command == '-remove':
+            if len(sys.argv) != 4:
+                print("Usage: -remove <website>")
+                return
+            handle_remove(conn, sys.argv[3])
+            
+        elif command == '-list':
+            handle_list(conn)
+            
+        else:
+            print(f"Unknown command: {command}")
+            
+    except Exception as e:
+        print(f"Critical Error: {e}")
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
-    run_phase_1_test()
+    main()
