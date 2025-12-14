@@ -5,10 +5,11 @@ import datetime
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
+from cryptography.exceptions import InvalidTag
 
 DB_NAME = "pwmanager.db"
-
-# --- 1. SETUP & CRYPTO (La fel ca Faza 1) ---
+CANARY_KEY_NAME = "canary_check"
+CANARY_VALUE = "valid_master_key"
 
 def get_db_connection():
     conn = sqlite3.connect(DB_NAME)
@@ -69,6 +70,24 @@ def decrypt_password(key, encrypted_data):
     ciphertext = encrypted_data[12:]
     return aesgcm.decrypt(nonce, ciphertext, None).decode('utf-8')
 
+def verify_master_password(conn, key):
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM vault_config WHERE key = ?", (CANARY_KEY_NAME,))
+    row = cursor.fetchone()
+
+    if row:
+        try:
+            decrypted = decrypt_password(key, row['value'])
+            if decrypted == CANARY_VALUE:
+                return True
+        except InvalidTag:
+            pass 
+        return False
+    else:
+        encrypted_canary = encrypt_password(key, CANARY_VALUE)
+        cursor.execute("INSERT INTO vault_config (key, value) VALUES (?, ?)", (CANARY_KEY_NAME, encrypted_canary))
+        conn.commit()
+        return True
 
 def handle_add(conn, key, website, username, password):
     cursor = conn.cursor()
@@ -95,7 +114,7 @@ def handle_add(conn, key, website, username, password):
 
 def handle_get(conn, key, website):
     cursor = conn.cursor()
-    cursor.execute("SELECT username, encrypted_password FROM passwords WHERE website = ?", (website,))
+    cursor.execute("SELECT username, encrypted_password, updated_at FROM passwords WHERE website = ?", (website,))
     row = cursor.fetchone()
     
     if row:
@@ -104,8 +123,9 @@ def handle_get(conn, key, website):
             print(f"Website:  {website}")
             print(f"Username: {row['username']}")
             print(f"Password: {decrypted_pass}")
-        except Exception:
-            print("Error: Decryption failed (Wrong master password or corrupt data).")
+            print(f"Updated:  {row['updated_at']}")
+        except InvalidTag:
+            print("Error: Integrity check failed.")
     else:
         print(f"No entry found for {website}")
 
@@ -131,7 +151,6 @@ def handle_list(conn):
         for row in rows:
             print(f"{row['website']:<20} | {row['username']}")
 
-
 def main():
     if len(sys.argv) < 3:
         print("Usage: pwmanager.py <master_password> -add <site> <user> <pass>")
@@ -145,10 +164,15 @@ def main():
     
     init_db()
     conn = get_db_connection()
-    salt = get_or_create_salt(conn)
-    key = derive_key(master_password, salt)
     
     try:
+        salt = get_or_create_salt(conn)
+        key = derive_key(master_password, salt)
+        
+        if not verify_master_password(conn, key):
+            print("Error: Wrong master password!")
+            sys.exit(1)
+            
         if command == '-add':
             if len(sys.argv) != 6:
                 print("Usage: -add <website> <username> <password>")
