@@ -12,9 +12,13 @@ CANARY_KEY_NAME = "canary_check"
 CANARY_VALUE = "valid_master_key"
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error as e:
+        print(f"Database Error: {e}")
+        sys.exit(1)
 
 def init_db():
     conn = get_db_connection()
@@ -87,12 +91,23 @@ def verify_master_password(conn, key):
         encrypted_canary = encrypt_password(key, CANARY_VALUE)
         cursor.execute("INSERT INTO vault_config (key, value) VALUES (?, ?)", (CANARY_KEY_NAME, encrypted_canary))
         conn.commit()
+        print("[+] First time setup: Vault initialized.")
         return True
+
+def print_usage():
+    print("\nPassword Manager CLI")
+    print("-" * 30)
+    print("Usage:")
+    print("  Add/Update: python pwmanager.py <master> -add <site> <user> <pass>")
+    print("  Retrieve:   python pwmanager.py <master> -get <site>")
+    print("  Remove:     python pwmanager.py <master> -remove <site>")
+    print("  List sites: python pwmanager.py <master> -list")
+    print("-" * 30)
 
 def handle_add(conn, key, website, username, password):
     cursor = conn.cursor()
     encrypted_pw = encrypt_password(key, password)
-    now = datetime.datetime.now().isoformat()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     cursor.execute("SELECT website FROM passwords WHERE website = ?", (website,))
     exists = cursor.fetchone()
@@ -103,13 +118,13 @@ def handle_add(conn, key, website, username, password):
             SET username=?, encrypted_password=?, updated_at=? 
             WHERE website=?
         ''', (username, encrypted_pw, now, website))
-        print(f"Updated entry for {website}")
+        print(f"[+] Successfully updated entry for: {website}")
     else:
         cursor.execute('''
             INSERT INTO passwords (website, username, encrypted_password, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?)
         ''', (website, username, encrypted_pw, now, now))
-        print(f"Added entry for {website}")
+        print(f"[+] Successfully added entry for: {website}")
     conn.commit()
 
 def handle_get(conn, key, website):
@@ -120,57 +135,55 @@ def handle_get(conn, key, website):
     if row:
         try:
             decrypted_pass = decrypt_password(key, row['encrypted_password'])
-            print(f"Website:  {website}")
-            print(f"Username: {row['username']}")
-            print(f"Password: {decrypted_pass}")
-            print(f"Updated:  {row['updated_at']}")
+            print(f"\n[+] Entry found for {website}:")
+            print(f"    Username: {row['username']}")
+            print(f"    Password: {decrypted_pass}")
+            print(f"    Updated:  {row['updated_at']}\n")
         except InvalidTag:
-            print("Error: Integrity check failed.")
+            print("[!] Error: Data corruption detected or integrity check failed.")
     else:
-        print(f"No entry found for {website}")
+        print(f"[-] No entry found for website: {website}")
 
 def handle_remove(conn, website):
     cursor = conn.cursor()
     cursor.execute("DELETE FROM passwords WHERE website = ?", (website,))
     if cursor.rowcount > 0:
         conn.commit()
-        print(f"Removed entry for {website}")
+        print(f"[+] Successfully removed entry for: {website}")
     else:
-        print(f"No entry found for {website}")
+        print(f"[-] No entry found to remove for: {website}")
 
 def handle_list(conn):
     cursor = conn.cursor()
-    cursor.execute("SELECT website, username FROM passwords")
+    cursor.execute("SELECT website, username FROM passwords ORDER BY website")
     rows = cursor.fetchall()
     
     if not rows:
-        print("Vault is empty.")
+        print("[-] Vault is empty.")
     else:
-        print(f"{'WEBSITE':<20} | {'USERNAME'}")
-        print("-" * 40)
+        print(f"\n{'WEBSITE':<25} | {'USERNAME'}")
+        print("-" * 45)
         for row in rows:
-            print(f"{row['website']:<20} | {row['username']}")
+            print(f"{row['website']:<25} | {row['username']}")
+        print("")
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: pwmanager.py <master_password> -add <site> <user> <pass>")
-        print("       pwmanager.py <master_password> -get <site>")
-        print("       pwmanager.py <master_password> -remove <site>")
-        print("       pwmanager.py <master_password> -list")
+        print_usage()
         return
 
     master_password = sys.argv[1]
     command = sys.argv[2]
     
     init_db()
-    conn = get_db_connection()
     
     try:
+        conn = get_db_connection()
         salt = get_or_create_salt(conn)
         key = derive_key(master_password, salt)
         
         if not verify_master_password(conn, key):
-            print("Error: Wrong master password!")
+            print("\n[!] ACCESS DENIED: Wrong master password.")
             sys.exit(1)
             
         if command == '-add':
@@ -195,12 +208,14 @@ def main():
             handle_list(conn)
             
         else:
-            print(f"Unknown command: {command}")
+            print(f"[!] Unknown command: {command}")
+            print_usage()
             
     except Exception as e:
-        print(f"Critical Error: {e}")
+        print(f"\n[!] Unexpected Error: {e}")
     finally:
-        conn.close()
+        if 'conn' in locals():
+            conn.close()
 
 if __name__ == "__main__":
     main()
